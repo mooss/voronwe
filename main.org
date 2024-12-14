@@ -1,0 +1,491 @@
+#+title: Project Voronwë
+#+subtitle: Persistent USB live system
+
+#+property: header-args:bash :noweb yes
+
+* Prelude
+** Sources
+
+The inspiration for this script comes from the following posts:
+ - https://mags.zone/help/arch-usb.html
+ - https://forum.manjaro.org/t/root-tip-how-to-manjaro-to-go-lxde-with-persistance/12596
+
+
+** Functions
+:PROPERTIES:
+:header-args:bash+: :noweb-ref functions
+:END:
+
+*** Primitives
+
+#+begin_src bash
+function fatal() {
+    echo "$@"
+    exit 1
+}
+
+function verbose() {
+    echo "$@"
+}
+
+function confirm() {
+    prompt="$1"; error="$2"
+    local yes; read -p "Confirm with uppercase 'yes' $prompt > " yes
+    [[ $yes == YES ]] || fatal "$error"
+}
+
+function assert-absent() {
+    [[ -e $1 ]] && fatal "$1 must not exist" || true
+    verbose "$1 is indeed absent"
+}
+
+function assert-present() {
+    [[ -e $1 ]] || fatal "$1 must exist"
+    verbose "$1 is indeed present"
+}
+#+end_src
+
+*** Operations on stdin
+
+#+begin_src bash
+
+#+end_src
+
+*** File alteration
+
+=extract-list= extracts a list from one line of a file using a regex and splits it across multiple lines.
+#+begin_src bash
+function extract-list() {
+    local -r path="$1" re="$2"
+    sed -n "s/^$re$/\1/p" "$path"\
+        | sed -r 's/\s+/\n/g'
+}
+#+end_src
+
+=replace-in= replaces in =$path= the first capture group of =$re= by the content of stdin.
+For example, with the file =file= containing the line =key:value;=, it would be replaced by =key:12;= with the following pipeline: =echo 12 | replace-in file 'key:(.*);'=.
+#+begin_src bash
+function replace-in() {
+    local -r path="$1" re="$2"
+    replacement=$(cat)
+    # ${re/\\(.\*\\)/$replacement} is Bash-specific.
+    sed -i "s/$re/${re/\\(.\*\\)/$replacement}/" "$path"
+}
+#+end_src
+
+=process-list-in-place= modifies a list from =$filename=, extracts the content from the first capture group, processes it using the rest of the arguments and replaces it in =$filename=.
+Will only work with one capture group and when the regex matches only once in =$filename=.
+#+begin_src bash
+function process-list-in-place() {
+    local -r filename="$1" re="$2"; shift; shift
+    extract-list "$filename" "$re" | "$@" | paste -sd' ' | replace-in "$filename" "$re"
+}
+#+end_src
+
+
+* Bootstrap
+:PROPERTIES:
+:header-args:bash+: :tangle bootstrap.bash :shebang "#!/usr/bin/env bash"
+:END:
+
+Strict mode and shared functions:
+#+begin_src bash
+set -euo pipefail
+<<functions>>
+#+end_src
+
+** Requirements
+
+Must be executed with root privileges:
+#+begin_src bash
+[[ $EUID == 0 ]] || fatal 'Root privileges required.'
+#+end_src
+
+Some folders must not exist:
+#+begin_src bash
+assert-absent /mnt/removeme
+assert-absent /removeme.bash
+#+end_src
+
+Most commands used are pretty standard, here are the less common ones:
+ - =pacstrap= (=pacman -S arch-install-scripts=)
+ - =jq=
+
+
+** Carefuly select the installation device
+
+*** Query available devices
+
+#+begin_src bash
+devices=$(lsblk --output PATH,VENDOR,MODEL,SIZE --nodeps --json | jq '.blockdevices')
+#+end_src
+
+*** Nice device table
+
+#+begin_src bash
+echo Available devices:
+echo "$devices"\
+    | jq -r '["device", "vendor", "model", "size"], ["------", "------", "-----", "----"], (.[] | [.path, .vendor, .model, .size]) | @tsv'\
+    | column -t -s $'\t'
+echo
+#+end_src
+
+*** Device selection
+
+#+begin_src bash
+echo 'Select a device to overwrite (will destroy pre-existing data):'
+select device in $(echo "$devices" | jq -r '.[] | .path'); do break; done
+echo
+#+end_src
+
+*** Device confirmation
+
+#+begin_src bash
+echo "Selected device is:"
+lsblk --output PATH,VENDOR,MODEL,SIZE --nodeps $device
+echo
+confirm "to overwrite $device" "Cancelling, will not overwrite."
+echo
+#+end_src
+
+
+** Prepare the installation media
+
+*** Wipe previous partition table
+
+#+begin_src bash
+wipefs --all --force $device
+#+end_src
+
+*** Create the partitions
+
+ 1. 10M BIOS.
+ 2. 500M EFI.
+ 3. 16G unencrypted storage. (4G for tests)
+ 4. Linux partition for the rest.
+#+begin_src bash
+sgdisk --clear\
+       --new 1:0:+10M  --typecode 1:EF02 --change-name 1:"BIOS boot partition"\
+       --new 2:0:+500M --typecode 2:EF00 --change-name 2:"EFI system"\
+       --new 3:0:+4G  --typecode 3:0700 --change-name 3:"Shared data"\
+       --new 4:0:0     --typecode 4:8300 --change-name 4:"Linux filesystem"\
+       $device
+#+end_src
+
+*** Wipe the partitions
+
+#+begin_src bash
+wipefs -af ${device}1
+wipefs -af ${device}2
+wipefs -af ${device}3
+wipefs -af ${device}4
+#+end_src
+
+*** Format the partitions
+
+The BIOS/MBR partition does not need to be formatted.
+
+#+begin_src bash
+mkfs.fat -F32 ${device}2
+mkfs.exfat    ${device}3
+mkfs.ext4     ${device}4
+#+end_src
+
+
+** Bootstrap the system
+
+*** Mount the installation media
+
+#+begin_src bash
+mkdir /mnt/removeme
+mount ${device}4 /mnt/removeme
+mkdir /mnt/removeme/boot
+mount ${device}2 /mnt/removeme/boot
+#+end_src
+
+*** Pacstrap
+
+#+begin_src bash
+pacstrap /mnt/removeme linux515 linux-firmware base vim
+sync
+#+end_src
+
+*** =fstab= generation
+
+=genfstab= tends to include the host's swapfile for some reason.
+
+#+begin_src bash
+genfstab -U /mnt/removeme | grep -v '^/swapfile' > /mnt/removeme/etc/fstab
+
+# Skip fstab verification.
+# echo Generated fstab; echo
+# cat /mnt/removeme/etc/fstab
+# confirm "that fstab was correctly generated" "Stopping installation"
+#+end_src
+
+
+** Execute the chroot script
+
+=removeme.bash= is used as a way to assert that the chroot script is running inside the arch chroot.
+#+begin_src bash
+assert-absent /removeme.bash
+verbose
+#+end_src
+
+
+#+begin_src bash
+cp chroot.bash /mnt/removeme/removeme.bash
+chmod +x /mnt/removeme/removeme.bash
+export device=$device
+echo "Entering chroot"; echo
+arch-chroot /mnt/removeme /removeme.bash || echo CHROOT FAILED
+#+end_src
+
+
+** Cleanup
+
+#+begin_src bash
+echo
+echo
+echo
+echo umount /mnt/removeme/boot
+echo umount /mnt/removeme
+echo rmdir /mnt/removeme
+#+end_src
+
+
+* =chroot= script
+:PROPERTIES:
+:header-args:bash+: :tangle chroot.bash
+:END:
+
+# (
+#+begin_src bash
+#!/usr/bin/env bash
+echo 'In chroot script :)'
+#+end_src
+
+
+Strict mode and shared functions:
+#+begin_src bash
+set -euo pipefail
+<<functions>>
+#+end_src
+
+** Preconditions
+
+*** File assertions
+
+#+begin_src bash
+assert-present /removeme.bash
+#+end_src
+
+*** Confirm =$device= value
+
+#+begin_src bash
+[[ -n $device ]] || fatal "\$device must be set."
+echo
+lsblk --output PATH,VENDOR,MODEL,SIZE --nodeps $device
+confirm "that $device is the installation media" "Stopping chroot script."
+#+end_src
+
+
+** Configure the system
+
+*** Locale
+
+#+begin_src bash
+ln -sf /usr/share/zoneinfo/Europe/Paris /etc/localtime
+hwclock --systohc
+sed -ri 's/#(en_GB.UTF-8 UTF-8)/\1/' /etc/locale.gen
+locale-gen
+echo LANG=en_GB.UTF-8 > /etc/locale.conf
+#+end_src
+
+*** =hostname=
+
+#+begin_src bash
+hostname=voronwe
+echo $hostname > /etc/hostname
+cat <<EOF
+127.0.0.1  localhost
+::1        localhost
+127.0.1.1  $hostname.localdomain  $hostname
+EOF
+#+end_src
+
+
+** Networking
+
+*** Wired
+
+systemd configuration:
+#+begin_src bash
+cat <<EOF > /etc/systemd/network/10-ethernet.network
+[Match]
+Name=en*
+Name=eth*
+
+[Network]
+DHCP=yes
+IPv6PrivacyExtensions=yes
+
+[DHCPv4]
+RouteMetric=10
+
+[IPv6AcceptRA]
+RouteMetric=10
+EOF
+
+systemctl enable systemd-networkd.service
+#+end_src
+
+*** Wireless
+
+=iwd= allows user control over wireless interfaces:
+#+begin_src bash
+pacman --noconfirm -S iwd
+systemctl enable iwd.service
+#+end_src
+
+systemd configuration:
+#+begin_src bash
+cat <<EOF > /etc/systemd/network/20-wifi.network
+[Match]
+Name=wl*
+
+[Network]
+DHCP=yes
+IPv6PrivacyExtensions=yes
+
+[DHCPv4]
+RouteMetric=20
+
+[IPv6AcceptRA]
+RouteMetric=20
+EOF
+
+systemctl enable systemd-resolved.service
+# Garbage debug:
+# echo
+# echo
+# df -h
+# echo
+# echo
+# df -h /run
+# df -h /etc
+# echo
+# echo
+
+# Cannot execute:
+#ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+#+end_src
+
+*** =timesyncd=
+
+#+begin_src bash
+systemctl enable systemd-timesyncd.service
+#+end_src
+
+
+** Users
+
+Root password:
+#+begin_src bash
+echo -e "root\nroot" | passwd
+#+end_src
+
+User creation:
+#+begin_src bash
+useradd -m mooss
+echo -e "mooss\nmooss" | passwd mooss
+#+end_src
+
+Additional groups:
+#+begin_src bash
+# groupadd wheel # wheel already exists.
+usermod -aG wheel mooss
+groupadd sudo
+usermod -aG sudo mooss
+#+end_src
+
+
+** Additional software
+
+*** =sudo=
+
+#+begin_src bash
+pacman --noconfirm -S sudo
+echo "%sudo ALL=(ALL) ALL" > /etc/sudoers.d/10-sudo
+#+end_src
+
+*** =polkit=
+
+Allow commands like =reboot= and =shutdown= to be run by non-root users.
+#+begin_src bash
+pacman --noconfirm -S polkit
+#+end_src
+
+*** Bootloader (=grub=)
+
+#+begin_src bash
+pacman --noconfirm -S grub efibootmgr # TODO remove interaction
+grub-install --target=i386-pc --recheck $device
+grub-install --target=x86_64-efi --efi-directory /boot --recheck --removable
+#+end_src
+
+
+** Minimize writes
+
+*** Filesystem options
+
+#+begin_src bash
+sed -r 's/relatime|atime/noatime/' /etc/fstab > /etc/fstab.new
+echo 'Minimizing filesystem writes:'
+diff -u /etc/fstab{,.new} || true
+confirm 'that the new fstab is well-formed' 'Badly formed fstab'
+mv /etc/fstab{.new,}
+#+end_src
+
+*** Systemd journal
+
+#+begin_src bash
+mkdir -p /etc/systemd/journald.conf.d
+cat <<EOF > /etc/systemd/journald.conf.d/10-volatile-storage.conf
+Storage=volatile
+SystemMaxUse=16M
+EOF
+#+end_src
+
+
+** Enhance compatibility
+
+*** =mkinitcpio=
+Don't autodetect modules when generating initramfs:
+#+begin_src bash
+process-list-in-place /etc/mkinitcpio.conf 'HOOKS=(\(.*\))' grep -v '^autodetect$'
+grep '^HOOKS=' /etc/mkinitcpio.conf
+#+end_src
+
+Don't generate fallback image, since it is redundant now that modules are not autodetected in the default image.
+#+begin_src bash
+process-list-in-place /etc/mkinitcpio.d/linux515.preset 'PRESETS=(\(.*\))' grep -v "'fallback'"
+grep '^PRESETS=' /etc/mkinitcpio.d/linux515.preset
+#+end_src
+
+Regenerate:
+#+begin_src bash
+rm /boot/initramfs-5.15-x86_64-fallback.img
+mkinitcpio -P
+grub-mkconfig -o /boot/grub/grub.cfg
+#+end_src
+
+
+*** Microcode
+
+#+begin_src bash
+pacman --noconfirm -S amd-ucode intel-ucode
+grub-mkconfig -o /boot/grub/grub.cfg
+#+end_src
+
+*** TODO Consider os-prober
